@@ -9,10 +9,10 @@ app.use(express.json());
 const LLM_URL = "http://localhost:8000/generate";
 const MCP_URL = "http://localhost:1337/mcp";
 
-// 세션 ID 저장 변수
+// 세션 ID 저장
 let sessionId = null;
 
-// MCP 초기화 요청
+// MCP 초기화
 async function initializeMcpSession() {
   try {
     const initRes = await axios.post(MCP_URL, {
@@ -42,13 +42,17 @@ async function initializeMcpSession() {
   }
 }
 
-const IMAGE_BASE_DIR = "/Users/soulx/Desktop/workspace/scenario-word/dist/tools/character";
+// 이미지 파일 서빙
+const STATIC_BASE_DIR = "/Users/soulx/Desktop/workspace/scenario-word/dist/tools";
+const ALLOWED_DIRS = ["character", "scene", "video", "webtoon"];
 
-// ✅ GET /image/:filename → 이미지 파일 서빙
-app.get("/image/:filename", (req, res) => {
-  const { filename } = req.params;
-  const fullPath = path.join(IMAGE_BASE_DIR, filename);
+app.get("/image/:type/:filename", (req, res) => {
+  const { type, filename } = req.params;
+  if (!ALLOWED_DIRS.includes(type)) {
+    return res.status(400).send("Invalid image category");
+  }
 
+  const fullPath = path.join(STATIC_BASE_DIR, type, filename);
   if (!fs.existsSync(fullPath)) {
     return res.status(404).send("File not found");
   }
@@ -62,63 +66,106 @@ app.post("/route", async (req, res) => {
   if (!userPrompt) return res.status(400).json({ error: "prompt is required" });
 
   try {
-    // 1. LLM 호출
+    // LLM 호출
     const llmRes = await axios.post(LLM_URL, {
       messages: [{ role: "user", content: userPrompt }]
     });
 
-    const { tool, input } = llmRes.data.output;
-    if (!tool || !input) {
-      return res.status(400).json({ error: "Invalid LLM response" });
+    console.log("[DEBUG] LLM 응답:", JSON.stringify(llmRes.data, null, 2));
+
+    let callList = llmRes.data.output;
+    if (!Array.isArray(callList)) {
+      if (typeof callList === "object" && callList.tool && callList.input) {
+        callList = [callList];
+      } else {
+        return res.status(400).json({ error: "LLM output is not a valid tool call" });
+      }
     }
 
-    // 2. MCP 호출 (JSON-RPC + 세션 헤더)
-    const mcpRes = await axios.post(MCP_URL, {
-      jsonrpc: "2.0",
-      id: "req-001",
-      method: "tools/call",
-      params: {
-        name: tool,
-        arguments: input
-      }
-    }, {
-      headers: {
-        Accept: "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "Mcp-Session-Id": sessionId
-      }
-    });
+    const allResults = [];
+    const context = {};
+    const aliasMap = {};
 
-    console.log("[DEBUG] MCP 전체 응답:", JSON.stringify(mcpRes.data, null, 2));
+    for (let i = 0; i < callList.length; i++) {
+      const { tool, input } = callList[i];
 
-    const results = mcpRes.data.map(entry => {
-      const contents = entry.result?.content || [];
-      const updatedContents = contents.map(item => {
-        if (item.type === "text") {
-          try {
-            const parsed = JSON.parse(item.text);
-            if (parsed.image_url && parsed.image_url.endsWith(".png")) {
-              const filename = path.basename(parsed.image_url);
-              parsed.image_url = `http://221.142.31.32:8001/image/${filename}`;
+      // ID 치환
+      if (input.character_ids) {
+        input.character_ids = input.character_ids.map(id => aliasMap[id] || id);
+      }
+      if (input.scene_ids) {
+        input.scene_ids = input.scene_ids.map(id => aliasMap[id] || id);
+      }
+
+      // MCP 툴 호출
+      const mcpRes = await axios.post(MCP_URL, {
+        jsonrpc: "2.0",
+        id: `req-${i}`,
+        method: "tools/call",
+        params: {
+          name: tool,
+          arguments: input
+        }
+      }, {
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          "Mcp-Session-Id": sessionId
+        }
+      });
+
+      const entries = mcpRes.data;
+      const ids = [];
+
+      for (const entry of entries) {
+        const content = entry.result?.content || [];
+
+        for (const item of content) {
+          if (item.type === "text") {
+            try {
+              const parsed = JSON.parse(item.text);
+
+              // ID 수집
+              if (parsed.character_id) ids.push(parsed.character_id);
+              if (parsed.scene_id) ids.push(parsed.scene_id);
+              if (parsed.webtoon_id) ids.push(parsed.webtoon_id);
+
+              // aliasMap 등록
+              if (tool === "createCharacter") {
+                aliasMap[`c-${context.characterCount ?? 1}`] = parsed.character_id;
+                context.characterCount = (context.characterCount ?? 1) + 1;
+              }
+              if (tool === "createScene") {
+                aliasMap[`s-${context.sceneCount ?? 1}`] = parsed.scene_id;
+                context.sceneCount = (context.sceneCount ?? 1) + 1;
+              }
+
+              const possibleKeys = ["image_url", "webtoon_url", "video_url"];
+              for (const key of possibleKeys) {
+                if (parsed[key] && (parsed[key].endsWith(".png") || parsed[key].endsWith(".mp4"))) {
+                  const segments = parsed[key].split("/");
+                  const type = segments[segments.length - 2]; // character, scene, video, webtoon
+                  const filename = segments[segments.length - 1];
+                  parsed[key] = `http://221.142.31.32:8001/image/${type}/${filename}`;
+                }
+              }
+
+              item.text = JSON.stringify(parsed);
+            } catch (e) {
+              console.error("[❌ JSON 파싱 실패]", item.text, e.message);
             }
-            item.text = JSON.stringify(parsed);
-          } catch (e) {
-            console.error("[JSON 파싱 실패]", item.text);
           }
         }
-        return item;
-      });
-    
-      return {
-        ...entry,
-        result: {
-          ...entry.result,
-          content: updatedContents
-        }
-      };
-    });
+      }
 
-    return res.json({ result: results });
+      // context 업데이트
+      if (tool === "createCharacter") context.character_ids = ids;
+      if (tool === "createScene") context.scene_ids = ids;
+
+      allResults.push(...entries);
+    }
+
+    return res.json({ result: allResults });
   } catch (e) {
     console.error("[중계 서버 ERROR]", e.response?.data || e.message);
     return res.status(500).json({ error: e.message });
